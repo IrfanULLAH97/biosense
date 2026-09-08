@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import math
 import os
+import pickle
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -524,22 +525,21 @@ def error_map(p: Params, n_c: int = 45, n_b: int = 45,
 # --------------------------------------------------------------------------
 
 
-def make_figures(p: Params, outdir: str = "results") -> None:
+def make_figures(p: Params, v1: dict, v2: dict, outdir: str = "results") -> None:
+    """Validation figures (Section 5 of the thesis)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     os.makedirs(outdir, exist_ok=True)
-
-    v1 = v1_analytical(p)
     r = v1["run"]
 
     fig, ax = plt.subplots(1, 2, figsize=(10, 4))
-    ax[0].plot(r["u"], v1["exact_profile"], "-", lw=2, label="analytical, Eq. (56)")
+    ax[0].plot(r["u"], v1["exact_profile"], "-", lw=2, label="analytical")
     ax[0].plot(r["u"][::5], r["psiS"][::5], "o", ms=4, mfc="none",
                label=f"numerical, N={r['N']}")
     ax[0].set_xlabel("$u = x/L$"); ax[0].set_ylabel(r"$\psi_S$")
-    ax[0].set_title("Steady substrate profile"); ax[0].legend()
+    ax[0].set_title("Steady state substrate profile"); ax[0].legend()
     ax[1].semilogy(r["u"], np.abs(r["psiS"] - v1["exact_profile"]) / p.psiS_inf)
     ax[1].set_xlabel("$u = x/L$")
     ax[1].set_ylabel(r"$|\psi_S^{num}-\psi_S^{exact}|/\psi_S^\infty$")
@@ -549,8 +549,8 @@ def make_figures(p: Params, outdir: str = "results") -> None:
 
     m = r["theta"] > 0
     fig, ax = plt.subplots(figsize=(6, 4))
-    ax.plot(r["theta"][m], v1["psiI_an"][m], "-", lw=2, label="analytical, Eq. (59)")
-    sl = slice(None, None, max(1, m.sum() // 40))
+    ax.plot(r["theta"][m], v1["psiI_an"][m], "-", lw=2, label="analytical")
+    sl = slice(None, None, max(1, int(m.sum()) // 40))
     ax.plot(r["theta"][m][sl], r["psiI"][m][sl], "o", ms=4, mfc="none",
             label="numerical")
     ax.set_xlabel(r"$\theta = D_e t/L^2$"); ax.set_ylabel(r"$\psi_I$")
@@ -558,14 +558,13 @@ def make_figures(p: Params, outdir: str = "results") -> None:
     fig.tight_layout(); fig.savefig(f"{outdir}/B_transient_current.png", dpi=150)
     plt.close(fig)
 
-    v2 = v2_asymptotic(p)
     fig, ax = plt.subplots(figsize=(6, 4))
-    ax.plot(v2["A"]["t"], v2["A"]["I"] * 1e9, "-", lw=2, label="original (A)")
+    ax.plot(v2["A"]["t"], v2["A"]["I"] * 1e9, "-", lw=2, label="detailed (A)")
     sl = slice(None, None, max(1, len(v2["C"]["t"]) // 40))
     ax.plot(v2["C"]["t"][sl], v2["C"]["I"][sl] * 1e9, "o", ms=4, mfc="none",
             label="reduced (C)")
     ax.set_xlabel("$t$, s"); ax.set_ylabel("$I$, nA")
-    ax.set_title(r"Asymptotic limit  $C_{s0}/K_m=k_{cat}/k_a=10^{-3}$")
+    ax.set_title(r"$C_{s0}/K_m=k_{cat}/k_a=10^{-3}$")
     ax.legend()
     fig.tight_layout(); fig.savefig(f"{outdir}/C_asymptotic.png", dpi=150)
     plt.close(fig)
@@ -583,44 +582,57 @@ def make_figures(p: Params, outdir: str = "results") -> None:
     plt.close(fig)
 
 
-def make_result_figures(p: Params, outdir: str = "results") -> dict:
-    """Figures and tables for the investigation of the approximation error."""
+def error_thresholds(p: Params, bds=(0.1, 0.5, 0.943, 2.0, 5.0, 10.0, 20.0),
+                     levels=(1.0, 5.0)) -> list[tuple]:
+    """Values of Cs0/Km at which E* reaches the given levels, per beta*delta."""
+    from scipy.optimize import brentq
+
+    def Estar(c, bd):
+        pr = replace(p, s=bd * p.alpha / Params.K1_PRIME, Cs0=c * p.Km)
+        IA = steady_bvp(pr, "A")[1]
+        IC = steady_bvp(pr, "C")[1]
+        return 100.0 * abs(IC - IA) / IA
+
+    out = []
+    for bd in bds:
+        row = [bd]
+        for lv in levels:
+            row.append(brentq(lambda c: Estar(c, bd) - lv, 1e-5, 1.0))
+        out.append(tuple(row))
+    return out
+
+
+def make_result_figures(p: Params, em: dict, ms: list, outdir: str = "results"):
+    """Error study figures (Section 6 of the thesis)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     os.makedirs(outdir, exist_ok=True)
-    out = {}
 
-    # E* vs Cs0/Km for several diffusion modules -------------------------
     cs = np.logspace(-3, 0, 40)
     fig, ax = plt.subplots(figsize=(6, 4.2))
     for bd, ls in ((0.1, ":"), (0.943, "-"), (5.0, "--"), (20.0, "-.")):
-        s_val = bd * p.alpha / Params.K1_PRIME
         E = []
         for c in cs:
-            pr = replace(p, s=s_val, Cs0=c * p.Km)
-            E.append(100 * abs(steady_bvp(pr, "C")[1] - steady_bvp(pr, "A")[1])
-                     / steady_bvp(pr, "A")[1])
+            pr = replace(p, s=bd * p.alpha / Params.K1_PRIME, Cs0=c * p.Km)
+            IA = steady_bvp(pr, "A")[1]
+            IC = steady_bvp(pr, "C")[1]
+            E.append(100 * abs(IC - IA) / IA)
         ax.loglog(cs, E, ls, lw=1.8, label=rf"$\beta\delta={bd:g}$")
-        out[f"E_bd{bd}"] = np.array(E)
     ax.axhline(1.0, color="0.5", lw=0.8)
     ax.text(1.1e-3, 1.15, "1 %", color="0.4", fontsize=9)
-    ax.set_xlabel(r"$C_{s0}/K_m$")
-    ax.set_ylabel(r"$E^{*}$, %")
+    ax.set_xlabel(r"$C_{s0}/K_m$"); ax.set_ylabel(r"$E^{*}$, %")
     ax.set_title("Steady state error of the reduced model")
     ax.legend(); ax.grid(alpha=0.3, which="both")
     fig.tight_layout(); fig.savefig(f"{outdir}/E_error_vs_Cs.png", dpi=150)
     plt.close(fig)
-    out["cs"] = cs
 
-    # contour map --------------------------------------------------------
-    m = error_map(p)
     fig, ax = plt.subplots(figsize=(6.4, 4.6))
     lv = [0.1, 0.5, 1, 2, 5, 10, 20, 40]
-    cf = ax.contourf(m["cs"], m["bd"], m["E"], levels=lv, cmap="viridis",
+    cf = ax.contourf(em["cs"], em["bd"], em["E"], levels=lv, cmap="viridis",
                      extend="both")
-    cl = ax.contour(m["cs"], m["bd"], m["E"], levels=[1.0, 5.0],
+    cl = ax.contour(em["cs"], em["bd"], em["E"], levels=[1.0, 5.0],
                     colors="w", linewidths=1.6)
     ax.clabel(cl, fmt="%g %%", fontsize=9)
     ax.set_xscale("log"); ax.set_yscale("log")
@@ -630,119 +642,165 @@ def make_result_figures(p: Params, outdir: str = "results") -> dict:
     fig.colorbar(cf, ax=ax, label=r"$E^{*}$, %")
     fig.tight_layout(); fig.savefig(f"{outdir}/F_error_map.png", dpi=150)
     plt.close(fig)
-    out["map"] = m
 
-    # mediator ratio -----------------------------------------------------
-    rows = mediator_sweep(p, ratios=(1e-3, 1e-2, 1e-1, 0.5, 1.0))
     fig, ax = plt.subplots(figsize=(6, 4.2))
-    rt = [r["kcat/ka"] for r in rows]
-    ax.semilogx(rt, [r["E_QSS_T"] for r in rows], "o-", lw=1.8,
-                label=r"$E_{T}$, models A vs B (quasi steady state)")
-    ax.semilogx(rt, [r["E_AB_star"] for r in rows], "s--", lw=1.8,
-                label=r"$E^{*}$, models A vs B (steady state)")
+    rt = [r["kcat/ka"] for r in ms]
+    ax.semilogx(rt, [r["E_QSS_T"] for r in ms], "o-", lw=1.8,
+                label=r"$E_{T,\mathrm{AB}}$ (response time)")
+    ax.semilogx(rt, [max(r["E_AB_star"], 1e-13) for r in ms], "s--", lw=1.8,
+                label=r"$E^{*}_{\mathrm{AB}}$ (steady state)")
     ax.set_xlabel(r"$k_{cat}/k_a$"); ax.set_ylabel("error, %")
     ax.set_yscale("log")
     ax.set_title("Effect of the quasi steady state assumption")
     ax.legend(fontsize=9); ax.grid(alpha=0.3, which="both")
     fig.tight_layout(); fig.savefig(f"{outdir}/G_qss_vs_mediator.png", dpi=150)
     plt.close(fig)
-    out["mediator"] = rows
-    return out
+
+
+# --------------------------------------------------------------------------
+
+
+# --------------------------------------------------------------------------
+# Stage cache
+# --------------------------------------------------------------------------
+
+CACHE_DIR = os.path.join("results", "cache")
+
+
+def cached(name: str, fn):
+    """
+    Return fn(), caching the value on disk under results/cache/.
+
+    A complete run takes several minutes.  Caching each stage separately means
+    an interrupted run resumes where it stopped.  Delete results/cache to force
+    everything to be recomputed.
+    """
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    path = os.path.join(CACHE_DIR, name + ".pkl")
+    if os.path.exists(path):
+        with open(path, "rb") as fh:
+            return pickle.load(fh)
+    value = fn()
+    with open(path, "wb") as fh:
+        pickle.dump(value, fh)
+    return value
 
 
 # --------------------------------------------------------------------------
 
 
 def main() -> None:
+    """Reproduce every table and figure of Sections 5 and 6 of the thesis."""
+    import time
+    t0 = time.time()
+
+    def stage(msg):
+        print(f"[{time.time()-t0:7.1f} s] {msg}", flush=True)
+
     p = Params()
+
+    # ---- all computations, each performed exactly once ------------------
+    stage("validation against the analytical solution ...")
+    v1 = cached("v1", lambda: v1_analytical(p))
+    stage("asymptotic regime ...")
+    v2 = cached("v2", lambda: v2_asymptotic(p))
+    stage("grid refinement ...")
+    v3 = cached("v3", lambda: v3_refinement(p))
+    stage("boundary treatments ...")
+    bo = cached("bo", lambda: boundary_order(p))
+    stage("forward Euler vs exponential update ...")
+    ag = cached("ag", lambda: e2_update_agreement(p))
+    stage("error vs substrate concentration ...")
+    md = cached("md", lambda: model_differences(p))
+    stage("error vs mediator ratio ...")
+    ms = cached("ms", lambda: mediator_sweep(
+        p, ratios=(1e-3, 1e-2, 1e-1, 0.5, 1.0), N=200))
+    stage("error thresholds ...")
+    th = cached("th", lambda: error_thresholds(p))
+    stage("error map ...")
+    em = cached("em", lambda: error_map(p))
+    stage("computations complete")
+
+    # ---- report ---------------------------------------------------------
     st = stability_dt(p, 100, "A", "euler")
-    print("=" * 74)
-    print("PARAMETERS")
-    print(f"  k1 = {p.k1:.6g} 1/s   eSigma = {p.eS:.6g} mol/m3 "
-          f"({p.eS*1e3:.3g} uM)   alpha = {p.alpha:.4g} 1/s")
-    print(f"  beta*delta = k1/alpha = {p.bd:.6f}   psiS_inf = {p.psiS_inf:.6f}")
-    print(f"  L^2/De = {p.L**2/p.De:.1f} s     1/ka = {1/p.ka:.1e} s")
-    print("STABILITY (N=100)")
-    print(f"  dt_diffusion <= {st['dt_diffusion']:.4e} s")
-    print(f"  dt_reaction  <= {st['dt_reaction']:.4e} s   "
-          f"(ratio {st['dt_diffusion']/st['dt_reaction']:.1f})")
+    W = "=" * 74
+    print(W); print("PARAMETERS  (Table 5.1, Table 5.2)")
+    print(f"  k1 = {p.k1:.6g} 1/s   eSigma = {p.eS:.6g} mol/m3   "
+          f"alpha = {p.alpha:.6g} 1/s")
+    print(f"  beta*delta = {p.bd:.6f}   psiS_inf = {p.psiS_inf:.6f}   "
+          f"L^2/De = {p.L**2/p.De:.1f} s")
+    for s_val in (4.63, 9.25, 18.5, 27.8):
+        pr = replace(p, s=s_val)
+        print(f"    s={s_val:6.2f} Unit/mg   k1={pr.k1:.4e} 1/s   "
+              f"eSigma={pr.eS:.4e} mol/m3   beta*delta={pr.bd:.4f}")
+    print("STABILITY (N=100), Section 4.7")
+    print(f"  diffusion  dt <= {st['dt_diffusion']:.4e} s")
+    print(f"  reaction   dt <= {st['dt_reaction']:.4e} s   "
+          f"ratio {st['dt_diffusion']/st['dt_reaction']:.1f}")
 
-    print("=" * 74)
-    print("V1  reduced model vs analytical solution")
-    v1 = v1_analytical(p)
-    print(f"  max profile error / psiS_inf : {v1['profile_err']:.3e}")
-    print(f"  steady current, numerical    : {v1['run']['Istar']*1e9:.4f} nA")
-    print(f"  steady current, analytical   : {v1['I_analytic']*1e9:.4f} nA")
-    print(f"  relative difference          : {v1['current_err']:.3e}")
-    print(f"  max transient current error  : {v1['transient_err']:.3e}"
-          f"   (series n_max = {v1['n_max']})")
-    print(f"  T_ss = {v1['run']['Tss']:.1f} s, T0.95 = {v1['run']['T095']:.1f} s")
+    print(W); print("VALIDATION (Section 5.2, 5.3, 5.4)")
+    print(f"  max profile error / psiS_inf   : {v1['profile_err']:.4e}")
+    print(f"  steady current, numerical      : {v1['run']['Istar']*1e9:.6f} nA")
+    print(f"  steady current, analytical     : {v1['I_analytic']*1e9:.6f} nA")
+    print(f"  relative difference            : {v1['current_err']:.4e}")
+    print(f"  max transient current error    : {v1['transient_err']:.4e}")
+    print(f"  series terms used (n_max)      : {v1['n_max']}")
+    print(f"  T_ss = {v1['run']['Tss']:.2f} s,  T0.95 = {v1['run']['T095']:.2f} s")
+    _, I_bvp_C = steady_bvp(p, "C")
+    _, I_bvp_A = steady_bvp(p, "A")
+    rA = cached("rA", lambda: simulate(p, model="A", N=400, eps=1e-5))
+    print(f"  Newton BVP, reduced            : {I_bvp_C*1e9:.6f} nA")
+    print(f"  Newton BVP, detailed           : {I_bvp_A*1e9:.6f} nA")
+    print(f"  time marching, detailed        : {rA['Istar']*1e9:.6f} nA  "
+          f"(rel. diff. {abs(I_bvp_A-rA['Istar'])/rA['Istar']:.2e})")
+    print(f"  asymptotic test: I* differ by  : {v2['rel_diff']:.4e}")
+    print(f"  asymptotic test: T0.95 differ  : {v2['T095_diff']:.4e}")
 
-    print("=" * 74)
-    print("V2  original vs reduced, Cs0/Km = kcat/ka = 1e-3")
-    v2 = v2_asymptotic(p)
-    print(f"  I*_A = {v2['A']['Istar']*1e12:.5f} pA   "
-          f"I*_C = {v2['C']['Istar']*1e12:.5f} pA")
-    print(f"  relative difference in I*    : {v2['rel_diff']:.3e}")
-    print(f"  relative difference in T0.95 : {v2['T095_diff']:.3e}")
-
-    print("=" * 74)
-    print("V3  refinement of the reduced model")
-    v3 = v3_refinement(p)
-    print("  time step (N=200):   (I* is a fixed point of the spatial scheme and")
-    print("                        is nearly independent of dt; T0.95 is not)")
+    print(W); print("REFINEMENT (Table 5.3)")
     for r in v3["time"]:
-        e = "   --   " if r["E"] is None else f"{r['E']:.3e}"
-        eT = "   --   " if r["ET"] is None else f"{r['ET']:.3e}"
-        print(f"    dt={r['dt']:.4e} s   I*={r['Istar']*1e9:.6f} nA   "
-              f"E_tau^I={e}   T0.95={r['T095']:.3f} s   E_tau^T={eT}")
-    print("  spatial grid:")
+        e = "     --    " if r["E"] is None else f"{r['E']:.4e}"
+        eT = "     --    " if r["ET"] is None else f"{r['ET']:.4e}"
+        print(f"  dt={r['dt']:.4e} s  I*={r['Istar']*1e9:.6f} nA  E_tau^I={e}"
+              f"  T0.95={r['T095']:.3f} s  E_tau^T={eT}")
     for r in v3["space"]:
-        eI = "   --   " if r["EI"] is None else f"{r['EI']:.3e}"
-        eC = "   --   " if r["EC"] is None else f"{r['EC']:.3e}"
-        print(f"    N={r['N']:4d}   I*={r['Istar']*1e9:.6f} nA   "
-              f"E_h^I={eI}   E_h^C={eC}")
+        eI = "     --    " if r["EI"] is None else f"{r['EI']:.4e}"
+        eC = "     --    " if r["EC"] is None else f"{r['EC']:.4e}"
+        print(f"  N={r['N']:4d}          I*={r['Istar']*1e9:.6f} nA  "
+              f"E_h^I={eI}  E_h^C={eC}")
 
-    print("=" * 74)
-    print("Boundary treatment, max |psiS - exact| / psiS_inf  [%]")
-    print("     N        Cs0=Cs1      ghost node")
-    for r in boundary_order(p):
-        print(f"  {r['N']:4d}    {r['copy']:10.5f}    {r['ghost']:12.7f}")
+    print(W); print("BOUNDARY TREATMENT (Table 5.4)   max|psiS-exact|/psiS_inf [%]")
+    print("      N        Cs,0=Cs,1       ghost node")
+    for r in bo:
+        print(f"   {r['N']:4d}     {r['copy']:10.5f}     {r['ghost']:12.7f}")
 
-    print("=" * 74)
-    print("e2 update: forward Euler vs exponential (model A)")
-    ag = e2_update_agreement(p)
-    print(f"  same dt   : relative difference in I* = "
-          f"{ag['rel_diff_same_dt']:.3e}")
-    print(f"  own dt    : relative difference in I* = "
-          f"{ag['rel_diff_own_dt']:.3e}")
-    print(f"  steps: euler {ag['euler']['steps']} vs exponential "
-          f"{ag['exp_own_dt']['steps']}  (speed-up {ag['speedup']:.0f}x)")
+    print(W); print("ENZYME UPDATE (Section 5.6)")
+    print(f"  same dt : rel. difference in I* = {ag['rel_diff_same_dt']:.4e}")
+    print(f"  own dt  : rel. difference in I* = {ag['rel_diff_own_dt']:.4e}")
+    print(f"  steps   : Euler {ag['euler']['steps']}  vs  exponential "
+          f"{ag['exp_own_dt']['steps']}   (factor {ag['speedup']:.0f})")
 
-    print("=" * 74)
-    print("Error of the reduction vs Cs0/Km   [%]      (N=100)")
-    print("  Cs0/Km     E*(A-C)   E*(A-B)    E_T(A-C)  E_QSS_T   L1(A-C)")
-    for r in model_differences(p):
-        print(f"  {r['Cs0/Km']:<8g} {r['E_star']:9.4f} {r['E_AB_star']:10.2e}"
-              f" {r['E_T']:9.4f} {r['E_QSS_T']:9.5f} {r['E_tr_L1']:9.4f}")
-    print("  E*(A-B) is zero to round-off at every substrate concentration:")
-    print("  the quasi steady state assumption has no effect on the steady state.")
+    print(W); print("QUASI STEADY STATE ASSUMPTION (Table 6.1)")
+    print("  kcat/ka    E*_AB [%]    E_T,AB [%]   max e2/eS (A)   max e2/eS (C)")
+    for r in ms:
+        print(f"  {r['kcat/ka']:<9g} {r['E_AB_star']:10.2e}  {r['E_QSS_T']:10.5f}"
+              f"   {r['e2A']:11.4f}   {r['A2_ratio']:11.4f}")
 
-    print("=" * 74)
-    print("Error of the reduction vs kcat/ka   [%]     (N=200)")
-    print("  kcat/ka    E*(A-B)    E_QSS_T   E*(A-C)   max e2/eS: model C   model A")
-    for r in mediator_sweep(p):
-        flag = "  <- (A2) fails" if r["A2_ratio"] > 1.0 else ""
-        print(f"  {r['kcat/ka']:<9g} {r['E_AB_star']:9.2e} {r['E_QSS_T']:9.5f}"
-              f" {r['E_star']:9.4f}      {r['A2_ratio']:8.4f}  {r['e2A']:8.4f}{flag}")
-    print("  The reduced model gives e2 = (k1/ka)Cs, so max e2/eS ="
-          " (kcat/ka)(Cs0/Km);")
-    print("  it exceeds unity, and the reduced model becomes unphysical, when"
-          " that product > 1.")
+    print(W); print("ERROR VS SUBSTRATE CONCENTRATION (Table 6.2)")
+    print("  Cs0/Km     E* [%]     E_T [%]    E_L1 [%]   E*/(Cs0/Km)")
+    for r in md:
+        print(f"  {r['Cs0/Km']:<9g} {r['E_star']:9.4f} {r['E_T']:9.4f}"
+              f" {r['E_tr_L1']:10.4f}   {r['E_star']/r['Cs0/Km']:8.1f}")
 
-    print("=" * 74)
-    make_figures(p)
-    print("figures written to ./results")
+    print(W); print("ERROR THRESHOLDS (Table 6.3)")
+    print("  beta*delta     E*=1%      E*=5%")
+    for bd, t1, t5 in th:
+        print(f"  {bd:9.3f}     {t1:.4f}     {t5:.4f}")
+
+    print(W)
+    stage("writing figures ...")
+    make_figures(p, v1, v2)
+    make_result_figures(p, em, ms)
+    stage("figures written to ./results")
 
 
 if __name__ == "__main__":
