@@ -459,17 +459,28 @@ def mediator_sweep(p: Params, ratios=(1e-3, 1e-2, 1e-1, 1.0),
 # --------------------------------------------------------------------------
 
 
-def steady_bvp(p: Params, model: str, N: int = 400) -> tuple[np.ndarray, float]:
+def steady_bvp(p: Params, model: str, N: int = 400,
+               guess: "np.ndarray | None" = None, tol: float = 1e-13,
+               max_iter: int = 200) -> tuple[np.ndarray, float]:
     """
-    Newton solution of the stationary problem  De*Cs'' = R(Cs),
+    Damped Newton solution of the stationary problem  De*Cs'' = R(Cs),
     Cs'(0) = 0 (ghost node), Cs(L) = Cs0.   Returns (Cs, I_steady).
 
     Models A and B share the same stationary equations, so 'A' and 'B' are
     equivalent here; 'C' uses the first-order rate.
+
+    At a large diffusion module and a large bulk concentration the kinetics
+    saturate and the substrate is driven towards zero in the interior of the
+    membrane.  An undamped Newton step then overshoots into negative
+    concentrations, where the reaction term is unphysical and the iteration
+    fails to converge.  The step is therefore damped so that the iterate stays
+    positive, with backtracking on the residual norm, and a continuation guess
+    may be supplied.  Non-convergence raises rather than returning silently.
     """
     from scipy.linalg import solve_banded
 
     dx = p.L / N
+    d2 = p.De / dx**2
     if model == "C":
         rate = lambda c: p.k1 * c
         drate = lambda c: np.full_like(c, p.k1)
@@ -478,28 +489,54 @@ def steady_bvp(p: Params, model: str, N: int = 400) -> tuple[np.ndarray, float]:
         rate = lambda c: p.kcat * p.eS * c / (p.Km + f * c)
         drate = lambda c: p.kcat * p.eS * p.Km / (p.Km + f * c) ** 2
 
-    C = np.full(N + 1, p.Cs0)
-    for _ in range(100):
+    def residual(C):
         F = np.zeros(N + 1)
-        lo = np.zeros(N + 1); di = np.zeros(N + 1); up = np.zeros(N + 1)
-        d2 = p.De / dx**2
         F[1:N] = d2 * (C[2:] - 2 * C[1:N] + C[:N - 1]) - rate(C[1:N])
-        lo[0:N - 1] = d2                      # sub-diagonal, shifted
+        F[0] = d2 * (2 * C[1] - 2 * C[0]) - rate(C[0:1])[0]
+        F[N] = p.Cs0 - C[N]
+        return F
+
+    if guess is None:
+        C = np.full(N + 1, p.Cs0)
+    else:
+        C = np.interp(np.linspace(0.0, 1.0, N + 1),
+                      np.linspace(0.0, 1.0, len(guess)), guess).copy()
+    C = np.maximum(C, 1e-300)
+
+    F = residual(C)
+    for _ in range(max_iter):
+        lo = np.zeros(N + 1); di = np.zeros(N + 1); up = np.zeros(N + 1)
+        lo[0:N - 1] = d2
         di[1:N] = -2 * d2 - drate(C[1:N])
         up[2:N + 1] = d2
-        F[0] = d2 * (2 * C[1] - 2 * C[0]) - rate(C[0:1])[0]
         di[0] = -2 * d2 - drate(C[0:1])[0]
         up[1] = 2 * d2
-        F[N] = p.Cs0 - C[N]
         di[N] = -1.0
         ab = np.zeros((3, N + 1))
-        ab[0, 1:] = up[1:]
-        ab[1, :] = di
-        ab[2, :-1] = lo[:-1]
-        d = solve_banded((1, 1), ab, -F)
-        C = C + d
-        if np.max(np.abs(d)) < 1e-16 * p.Cs0:
+        ab[0, 1:] = up[1:]; ab[1, :] = di; ab[2, :-1] = lo[:-1]
+        step = solve_banded((1, 1), ab, -F)
+
+        # damp so that the iterate cannot fall below a tenth of its value
+        neg = step < 0.0
+        lam = 1.0
+        if np.any(neg):
+            lam = min(1.0, 0.9 * np.min(C[neg] / (-step[neg] + 1e-300)))
+            lam = max(lam, 1e-4)
+        f0 = np.linalg.norm(F)
+        for _ in range(40):                       # backtracking line search
+            Cn = np.maximum(C + lam * step, 0.0)
+            Fn = residual(Cn)
+            if np.linalg.norm(Fn) <= (1.0 - 1e-4 * lam) * f0 or lam < 1e-12:
+                break
+            lam *= 0.5
+        C, F = Cn, Fn
+        if np.max(np.abs(lam * step)) < tol * max(p.Cs0, 1e-300):
             break
+    else:
+        raise RuntimeError(
+            f"steady_bvp did not converge (model {model}, N={N}, "
+            f"Cs0/Km={p.Cs0/p.Km:.3g}, beta*delta={p.bd:.3g})")
+
     I = p.q * p.Ae * _trapz(rate(C), dx=dx)
     return C, I
 
@@ -661,6 +698,245 @@ def make_result_figures(p: Params, em: dict, ms: list, outdir: str = "results"):
 
 
 # --------------------------------------------------------------------------
+# Dimensionless structure and wide-range parameter studies
+# --------------------------------------------------------------------------
+
+
+def group_invariance_check(p: Params, f: float = 2.5) -> dict:
+    """
+    Confirm that the dimensionless response depends only on
+    (beta, gamma, beta*delta, psiS_inf).
+
+    A second parameter set is built with different dimensional values but the
+    same four groups; the dimensionless responses must coincide.
+    """
+    alt = replace(p, L=p.L * f, De=p.De * f**2)          # beta, gamma, delta fixed
+    r1 = simulate(p, model="A", N=100, eps=1e-4)
+    r2 = simulate(alt, model="A", N=100, eps=1e-4)
+    th = np.linspace(0.0, min(r1["theta"][-1], r2["theta"][-1]), 400)[1:]
+    a = np.interp(th, r1["theta"], r1["psiI"])
+    b = np.interp(th, r2["theta"], r2["psiI"])
+    return {
+        "groups": (p.beta, p.gamma, p.bd, p.psiS_inf),
+        "groups_alt": (alt.beta, alt.gamma, alt.bd, alt.psiS_inf),
+        "max_rel_dev": float(np.max(np.abs(a - b)) / r1["psiI"][-1]),
+        "I_dimensional": (r1["Istar"], r2["Istar"]),
+        "psiI_star": (float(r1["psiI"][-1]), float(r2["psiI"][-1])),
+    }
+
+
+def _bvp_N(bd: float) -> int:
+    """Grid fine enough to resolve the reaction boundary layer of width 1/sqrt(bd)."""
+    return int(min(3200, max(400, 200 * math.sqrt(max(bd, 1.0)))))
+
+
+def _Estar(p: Params, psi: float, bd: float, ratio: float) -> float:
+    """Steady state error of the reduced model, per cent, from the direct solver."""
+    pr = replace(p, s=bd * p.alpha / Params.K1_PRIME, Cs0=psi * p.Km,
+                 ka=p.kcat / ratio)
+    N = _bvp_N(bd)
+    IA = steady_bvp(pr, "A", N=N)[1]
+    IC = steady_bvp(pr, "C", N=N)[1]
+    return 100.0 * abs(IC - IA) / IA
+
+
+def error_map_wide(p: Params, n_psi: int = 40, n_bd: int = 40,
+                   psi_range=(1e-3, 10.0), bd_range=(0.01, 100.0),
+                   ratio: float = 1e-3) -> dict:
+    """Steady state error over four decades of psiS_inf and of beta*delta."""
+    psis = np.logspace(math.log10(psi_range[0]), math.log10(psi_range[1]), n_psi)
+    bds = np.logspace(math.log10(bd_range[0]), math.log10(bd_range[1]), n_bd)
+    E = np.zeros((n_bd, n_psi))
+    for i, bd in enumerate(bds):
+        for j, psi in enumerate(psis):
+            E[i, j] = _Estar(p, psi, bd, ratio)
+    return {"psi": psis, "bd": bds, "E": E, "ratio": ratio}
+
+
+def steady_error_vs_mediator(p: Params,
+                             ratios=(1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0),
+                             psis=(0.01, 0.1, 1.0), bd: float = 0.943) -> list:
+    """Dependence of the steady state error on kcat/ka."""
+    rows = []
+    for r in ratios:
+        row = {"kcat/ka": r}
+        for psi in psis:
+            row[psi] = _Estar(p, psi, bd, r)
+            row[f"A2_{psi}"] = r * psi          # Eq. max e2/eSigma for model C
+        rows.append(row)
+    return rows
+
+
+def steady_error_gamma_independence(p: Params,
+                                    gammas=(1e2, 1e4, 1e6, 1e8)) -> list:
+    """
+    The steady state error must not depend on gamma.
+
+    gamma is varied at fixed beta*delta, psiS_inf and kcat/ka by scaling kcat
+    and ka together; eSigma = k1*Km/kcat then adjusts so that k1 is unchanged.
+    """
+    ratio = p.kcat / p.ka
+    rows = []
+    for g in gammas:
+        kcat = g * ratio * p.De / p.L**2         # gamma = ka L^2/De, ka = kcat/ratio
+        pr = replace(p, kcat=kcat, ka=kcat / ratio)
+        N = _bvp_N(pr.bd)
+        IA = steady_bvp(pr, "A", N=N)[1]
+        IC = steady_bvp(pr, "C", N=N)[1]
+        rows.append({"gamma": pr.gamma, "bd": pr.bd, "kcat/ka": pr.kcat / pr.ka,
+                     "E_star": 100.0 * abs(IC - IA) / IA})
+    return rows
+
+
+def qss_vs_gamma(p: Params, gammas=(1.0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7),
+                 N: int = 200, eps: float = 1e-4) -> list:
+    """
+    Error of the quasi steady state assumption against the dimensionless
+    mediator reduction rate gamma = ka L^2/De, at fixed beta*delta, psiS_inf
+    and kcat/ka.
+    """
+    ratio = p.kcat / p.ka
+    rows = []
+    for g in gammas:
+        kcat = g * ratio * p.De / p.L**2
+        pr = replace(p, kcat=kcat, ka=kcat / ratio)
+        A = simulate(pr, model="A", N=N, eps=eps)
+        B = simulate(pr, model="B", N=N, eps=eps)
+        rows.append({
+            "gamma": pr.gamma,
+            "E_star_AB": 100.0 * abs(B["Istar"] - A["Istar"]) / A["Istar"],
+            "E_T_AB": 100.0 * abs(B["T095"] - A["T095"]) / A["T095"],
+            "L1_AB": 100.0 * compare_transient(A, B)["L1"],
+            "e2max_A": A["e2max_over_eS"],
+        })
+    return rows
+
+
+def make_wide_figures(p: Params, mw: dict, qg: list, outdir: str = "results"):
+    """Figures for the wide-range error study (Chapter 6)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    os.makedirs(outdir, exist_ok=True)
+    r0 = p.kcat / p.ka
+
+    fig, ax = plt.subplots(figsize=(6.6, 4.8))
+    lv = [0.1, 0.5, 1, 2, 5, 10, 25, 50, 100, 250]
+    cf = ax.contourf(mw["psi"], mw["bd"], mw["E"], levels=lv, cmap="viridis",
+                     extend="both")
+    cl = ax.contour(mw["psi"], mw["bd"], mw["E"], levels=[1.0, 5.0, 10.0],
+                    colors="w", linewidths=1.6)
+    ax.clabel(cl, fmt="%g %%", fontsize=9)
+    ax.axvline(0.2, color="r", ls="--", lw=1.3)
+    ax.text(0.215, 0.013, r"$\Psi=0.2$", color="r", fontsize=9,
+            rotation=90, va="bottom")
+    ax.set_xscale("log"); ax.set_yscale("log")
+    ax.set_xlabel(r"$\Psi=(1+k_{cat}/k_a)\,C_{s0}/K_m$")
+    ax.set_ylabel(r"$\beta\delta=k_1L^2/D_e$")
+    ax.set_title(r"$E^{*}$ [%] over the complete governing plane")
+    fig.colorbar(cf, ax=ax, label=r"$E^{*}$, %")
+    fig.tight_layout(); fig.savefig(f"{outdir}/H_error_map_wide.png", dpi=150)
+    plt.close(fig)
+
+    Psi = np.logspace(-3, 1, 50)
+    fig, ax = plt.subplots(figsize=(6.2, 4.3))
+    for bd, ls in ((0.01, ":"), (0.943, "-"), (10.0, "--"), (100.0, "-.")):
+        E = [_Estar(p, P / (1 + r0), bd, r0) for P in Psi]
+        ax.loglog(Psi, E, ls, lw=1.8, label=rf"$\beta\delta={bd:g}$")
+    ax.axhline(1.0, color="0.55", lw=0.8)
+    ax.text(1.2e-3, 1.15, "1 %", color="0.4", fontsize=9)
+    ax.axvline(0.2, color="r", ls="--", lw=1.1)
+    ax.text(0.22, 2e-2, r"$\Psi=0.2$", color="r", fontsize=9)
+    ax.set_xlabel(r"$\Psi=(1+k_{cat}/k_a)\,C_{s0}/K_m$")
+    ax.set_ylabel(r"$E^{*}$, %")
+    ax.set_title("Steady state error of the reduced model")
+    ax.legend(fontsize=9); ax.grid(alpha=0.3, which="both")
+    fig.tight_layout(); fig.savefig(f"{outdir}/I_error_vs_Psi.png", dpi=150)
+    plt.close(fig)
+
+    g = np.array([r["gamma"] for r in qg])
+    eT = np.array([r["E_T_AB"] for r in qg])
+    eS = np.array([max(r["E_star_AB"], 1e-13) for r in qg])
+    fig, ax = plt.subplots(figsize=(6.2, 4.3))
+    ax.loglog(g, eT, "o-", lw=1.8, label=r"$E_{T,\mathrm{AB}}$ (response time)")
+    ax.loglog(g, eS, "s--", lw=1.8, label=r"$E^{*}_{\mathrm{AB}}$ (steady state)")
+    gg = np.logspace(1, 7, 50)
+    ax.loglog(gg, 124.6 / gg, "k:", lw=1.2, label=r"$124.6/\gamma$")
+    ax.axhline(1.0, color="0.55", lw=0.8)
+    ax.set_xlabel(r"$\gamma=k_aL^2/D_e$"); ax.set_ylabel("error, %")
+    ax.set_title("Error of the quasi steady state assumption")
+    ax.legend(fontsize=9); ax.grid(alpha=0.3, which="both")
+    fig.tight_layout(); fig.savefig(f"{outdir}/J_qss_vs_gamma.png", dpi=150)
+    plt.close(fig)
+
+
+def _wide_thresholds(p: Params,
+                     bds=(0.01, 0.1, 0.5, 0.943, 2.0, 5.0, 10.0, 30.0, 100.0),
+                     levels=(1.0, 5.0, 10.0)) -> list:
+    """Psi at which the steady state error reaches each level, per beta*delta."""
+    from scipy.optimize import brentq
+    r0 = p.kcat / p.ka
+    out = []
+    for bd in bds:
+        row = [bd]
+        for lv in levels:
+            row.append(brentq(
+                lambda P: _Estar(p, P / (1.0 + r0), bd, r0) - lv, 1e-6, 60.0))
+        out.append(tuple(row))
+    return out
+
+
+def qss_constant_scan(p: Params,
+                      cases=((0.943, 0.121212), (10.0, 0.121212), (0.943, 1.0)),
+                      gammas=(100.0, 1000.0), N: int = 200,
+                      eps: float = 1e-4) -> list:
+    """
+    The proportionality constant in E_{T,AB} ~ C/gamma, at several values of
+    the diffusion module and the dimensionless bulk concentration.
+
+    gamma is varied at fixed beta*delta, psiS_inf and kcat/ka by scaling kcat
+    and ka together, so that k1 and hence beta*delta are unchanged.
+    """
+    rows = []
+    for bd, psi in cases:
+        p0 = replace(p, s=bd * p.alpha / Params.K1_PRIME, Cs0=psi * p.Km)
+        ratio = p0.kcat / p0.ka
+        row = {"bd": bd, "psi": psi, "C": []}
+        for g in gammas:
+            kcat = g * ratio * p0.De / p0.L**2
+            pr = replace(p0, kcat=kcat, ka=kcat / ratio)
+            A = simulate(pr, model="A", N=N, eps=eps)
+            B = simulate(pr, model="B", N=N, eps=eps)
+            eT = 100.0 * abs(B["T095"] - A["T095"]) / A["T095"]
+            row["C"].append(eT * pr.gamma)
+        rows.append(row)
+    return rows
+
+
+def timing_comparison(p: Params, N: int = 100, eps: float = 1e-3) -> dict:
+    """
+    Separate the reduction in the NUMBER of time steps from the reduction in
+    wall-clock time: the exponential update costs an exponential per node per
+    step, so the two factors are not the same.
+    """
+    import time
+    dt = 0.9 * stability_dt(p, N, "A", "euler")["dt_max"]
+    t0 = time.perf_counter()
+    a = simulate(p, model="A", e2_update="euler", N=N, dt=dt, eps=eps,
+                 store_every=200)
+    t_euler = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    c = simulate(p, model="A", e2_update="exp", N=N, eps=eps)
+    t_exp = time.perf_counter() - t0
+    return {"steps_euler": a["steps"], "steps_exp": c["steps"],
+            "step_factor": a["steps"] / c["steps"],
+            "wall_euler": t_euler, "wall_exp": t_exp,
+            "wall_factor": t_euler / t_exp,
+            "rel_diff_Istar": abs(a["Istar"] - c["Istar"]) / a["Istar"]}
+
+
+# --------------------------------------------------------------------------
 # Stage cache
 # --------------------------------------------------------------------------
 
@@ -712,13 +988,20 @@ def main() -> None:
     ag = cached("ag", lambda: e2_update_agreement(p))
     stage("error vs substrate concentration ...")
     md = cached("md", lambda: model_differences(p))
-    stage("error vs mediator ratio ...")
-    ms = cached("ms", lambda: mediator_sweep(
-        p, ratios=(1e-3, 1e-2, 1e-1, 0.5, 1.0), N=200))
-    stage("error thresholds ...")
-    th = cached("th", lambda: error_thresholds(p))
-    stage("error map ...")
-    em = cached("em", lambda: error_map(p))
+    stage("group invariance ...")
+    gi = cached("gi", lambda: group_invariance_check(p))
+    stage("timing comparison ...")
+    tm = cached("timing", lambda: timing_comparison(p))
+    stage("QSS versus gamma ...")
+    qg = cached("qss_gamma", lambda: qss_vs_gamma(p))
+    stage("proportionality constant in E_T ~ C/gamma ...")
+    qc = cached("qss_const", lambda: qss_constant_scan(p))
+    stage("gamma independence of the steady error ...")
+    gind = cached("gind", lambda: steady_error_gamma_independence(p))
+    stage("wide error map ...")
+    mw = cached("map_wide", lambda: error_map_wide(p))
+    stage("wide thresholds ...")
+    thw = cached("thresh_wide", lambda: _wide_thresholds(p))
     stage("computations complete")
 
     # ---- report ---------------------------------------------------------
@@ -779,27 +1062,66 @@ def main() -> None:
     print(f"  steps   : Euler {ag['euler']['steps']}  vs  exponential "
           f"{ag['exp_own_dt']['steps']}   (factor {ag['speedup']:.0f})")
 
-    print(W); print("QUASI STEADY STATE ASSUMPTION (Table 6.1)")
-    print("  kcat/ka    E*_AB [%]    E_T,AB [%]   max e2/eS (A)   max e2/eS (C)")
-    for r in ms:
-        print(f"  {r['kcat/ka']:<9g} {r['E_AB_star']:10.2e}  {r['E_QSS_T']:10.5f}"
-              f"   {r['e2A']:11.4f}   {r['A2_ratio']:11.4f}")
-
     print(W); print("ERROR VS SUBSTRATE CONCENTRATION (Table 6.2)")
     print("  Cs0/Km     E* [%]     E_T [%]    E_L1 [%]   E*/(Cs0/Km)")
     for r in md:
         print(f"  {r['Cs0/Km']:<9g} {r['E_star']:9.4f} {r['E_T']:9.4f}"
               f" {r['E_tr_L1']:10.4f}   {r['E_star']/r['Cs0/Km']:8.1f}")
 
-    print(W); print("ERROR THRESHOLDS (Table 6.3)")
-    print("  beta*delta     E*=1%      E*=5%")
-    for bd, t1, t5 in th:
-        print(f"  {bd:9.3f}     {t1:.4f}     {t5:.4f}")
+    print(W); print("DIMENSIONLESS GROUP INVARIANCE (Section 5.2)")
+    print(f"  groups set 1 (beta,gamma,beta*delta,psiS_inf): "
+          f"{tuple(round(float(v),6) for v in gi['groups'])}")
+    print(f"  groups set 2                                 : "
+          f"{tuple(round(float(v),6) for v in gi['groups_alt'])}")
+    print(f"  dimensional I*  : {gi['I_dimensional'][0]*1e9:.4f} nA  vs  "
+          f"{gi['I_dimensional'][1]*1e9:.4f} nA")
+    print(f"  dimensionless psiI* : {gi['psiI_star'][0]:.10e}  vs  "
+          f"{gi['psiI_star'][1]:.10e}")
+    print(f"  max relative deviation of psiI(theta) : {gi['max_rel_dev']:.3e}")
+
+    print(W); print("TIMING: STEPS VERSUS WALL CLOCK (Section 5.9)")
+    print(f"  steps      : Euler {tm['steps_euler']}  exponential "
+          f"{tm['steps_exp']}   factor {tm['step_factor']:.1f}")
+    print(f"  wall clock : Euler {tm['wall_euler']:.2f} s  exponential "
+          f"{tm['wall_exp']:.2f} s   factor {tm['wall_factor']:.1f}")
+    print(f"  cost per step ratio (exp/Euler) : "
+          f"{(tm['wall_exp']/tm['steps_exp'])/(tm['wall_euler']/tm['steps_euler']):.2f}")
+    print(f"  relative difference in I*       : {tm['rel_diff_Istar']:.3e}")
+
+    print(W); print("QSS ASSUMPTION VERSUS gamma = ka L^2/De (Table 6.1)")
+    print("     gamma     E*_AB [%]    E_T,AB [%]   L1_AB [%]   E_T,AB * gamma")
+    for r in qg:
+        print(f"  {r['gamma']:9.3g}   {r['E_star_AB']:10.3e}  {r['E_T_AB']:11.5f}"
+              f" {r['L1_AB']:10.5f}   {r['E_T_AB']*r['gamma']:12.1f}")
+
+    print(W); print("CONSTANT IN E_T,AB ~ C/gamma (Section 6.2)")
+    print("   beta*delta   psiS_inf    C at gamma=100   C at gamma=1000")
+    for r in qc:
+        print(f"   {r['bd']:9.3g} {r['psi']:10.4g}   {r['C'][0]:14.1f}  {r['C'][1]:16.1f}")
+
+    print(W); print("STEADY ERROR IS INDEPENDENT OF gamma (Section 6.2)")
+    for r in gind:
+        print(f"  gamma={r['gamma']:9.3g}  beta*delta={r['bd']:.4f}  "
+              f"kcat/ka={r['kcat/ka']:.3g}   E* = {r['E_star']:.6f} %")
+
+    print(W); print("COLLAPSE ONTO Psi = (1+kcat/ka)Cs0/Km (Section 6.3)")
+    print("   beta*delta    Psi     E* for kcat/ka = 1e-3 ... 10        spread")
+    for bd in (0.1, 0.943, 10.0):
+        for Psi in (0.011, 0.11, 1.1):
+            v = [_Estar(p, Psi/(1+r), bd, r) for r in (1e-3, 1e-2, 1e-1, 1.0, 10.0)]
+            print(f"   {bd:9.3g} {Psi:7.4g}   " + " ".join(f"{x:8.4f}" for x in v)
+                  + f"   {(max(v)-min(v))/max(v):.1e}")
+
+    print(W); print("VALIDITY THRESHOLDS IN Psi (Table 6.3)")
+    print("   beta*delta     E*=1%      E*=5%     E*=10%")
+    for bd, a, b, c in thw:
+        print(f"   {bd:9.3g}   {a:8.4f}  {b:8.4f}  {c:8.4f}")
+    print(f"  wide map range: E* from {mw['E'].min():.4f} % to {mw['E'].max():.1f} %")
 
     print(W)
     stage("writing figures ...")
     make_figures(p, v1, v2)
-    make_result_figures(p, em, ms)
+    make_wide_figures(p, mw, qg)
     stage("figures written to ./results")
 
 
